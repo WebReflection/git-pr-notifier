@@ -263,6 +263,8 @@ while IFS= read -r pr; do
       {
         echo "# PR #$number - bot check failed"
         echo
+        echo "https://github.com/$REPO/pull/$number"
+        echo
         echo "\`$BOT_CHECK_NAME\` did not succeed after $BUMP_RESULT retry cycles."
         echo
         echo "- Final status: $(jq -r '.status // ""' <<<"$check_json") / $conclusion"
@@ -407,6 +409,8 @@ while IFS= read -r pr; do
       {
         echo "# PR #$number - AI counter-check failed"
         echo
+        echo "https://github.com/$REPO/pull/$number"
+        echo
         echo "_This is an AI/tooling failure, **not** a verdict on the PR. Bot check \`$BOT_CHECK_NAME\`: SUCCESS. Scanned: $(now_iso)._"
         echo
         echo "- Model: \`$AI_MODEL\` (reasoning: $AI_VARIANT)"
@@ -441,6 +445,8 @@ while IFS= read -r pr; do
   if [ "$findings_count" -gt 0 ]; then
     {
       echo "# PR #$number - findings"
+      echo
+      echo "https://github.com/$REPO/pull/$number"
       echo
       echo "_Bot check \`$BOT_CHECK_NAME\`: SUCCESS. AI counter-check: $ai_note. Scanned: $(now_iso)._"
       echo
