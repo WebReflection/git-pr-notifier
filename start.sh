@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Idempotent installer for the Marius PR Review Watcher cron job.
+# git-pr-notifier - idempotent cron installer.
 # Safe to run repeatedly: always results in exactly one cron entry.
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MARKER="# marius-pr-review-job"
+MARKER="# git-pr-notifier-job"
+# Matches entries from this marker and from any previous personal marker so
+# rerunning this script replaces older installations cleanly.
+CRON_TAG_RE='(pr-review-job|pr-notifier-job|check_prs\.sh)'
 CRON_LINE="*/2 * * * * $SCRIPT_DIR/check_prs.sh >> $SCRIPT_DIR/cron_check.log 2>&1"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
@@ -21,13 +24,13 @@ if ! gh api rate_limit -q .resources.core.remaining >/dev/null 2>&1; then
 fi
 
 # If already installed, remove the existing entry first (stop-then-install).
-if crontab -l 2>/dev/null | grep -qF "$MARKER"; then
+if crontab -l 2>/dev/null | grep -qE "$CRON_TAG_RE"; then
   echo "Existing installation found - removing it first"
   "$SCRIPT_DIR/stop.sh"
 fi
 
 {
-  crontab -l 2>/dev/null | grep -vE '(marius-pr-review-job|check_prs\.sh)' || true
+  crontab -l 2>/dev/null | grep -vE "$CRON_TAG_RE" || true
   echo "$MARKER"
   echo "$CRON_LINE"
 } | crontab -

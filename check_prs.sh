@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Marius PR Review Watcher - worker.
+# git-pr-notifier - worker.
 # Invoked by cron every 2 minutes (installed by start.sh) and once by start.sh.
-# For new open PRs in $REPO authored by $AUTHOR: wait for the "$BOT_CHECK_NAME"
+# For new open PRs in $REPO authored by any login in $AUTHORS: wait for the "$BOT_CHECK_NAME"
 # check to succeed, counter-verify the diff with the local Kilo CLI, run
 # heuristic scans for issues the bot did not flag, notify on macOS, and persist
 # findings. State lives in ./state/.
@@ -12,17 +12,18 @@ export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# --- Configuration (defaults; overridden by config.env) ---
-REPO="Kilo-Org/kilocode"
-AUTHOR="marius-kilocode"
-BOT_CHECK_NAME="Kilo Code Review"
-RETRY_LIMIT=30
-SOUND="Glass"
-AI_PROVIDER="GLM v5.3 Flash - Spark"
-AI_MODEL_ID="GLM-5.3-Flash-EXL3"
-AI_MODEL="$AI_PROVIDER/$AI_MODEL_ID"
-AI_VARIANT="max"
-AI_TIMEOUT=1800
+# --- Configuration: every value is mandatory and comes from config.env ---
+# No defaults here on purpose: real repo/author/model details must not be
+# published in this repository. See config.env.example.
+REPO=""
+AUTHORS=""
+BOT_CHECK_NAME=""
+RETRY_LIMIT=""
+SOUND=""
+AI_PROVIDER=""
+AI_MODEL_ID=""
+AI_VARIANT=""
+AI_TIMEOUT=""
 AI_CONFIG="$SCRIPT_DIR/kilo-ai.json"
 
 # shellcheck disable=SC1091
@@ -37,6 +38,11 @@ if [ -f "$SCRIPT_DIR/gh_token.env" ]; then
   source "$SCRIPT_DIR/gh_token.env"
 fi
 
+# Normalize AUTHORS (comma-separated GitHub logins) into a JSON array for the
+# jq filters below. GitHub logins cannot contain whitespace or commas, so
+# stripping all whitespace first is safe and tolerates "a, b" or stray commas.
+authors_json="$(printf '%s' "$AUTHORS" | tr -d '[:space:]' | jq -cR 'split(",") | map(select(length > 0))')"
+
 STATE_DIR="$SCRIPT_DIR/state"
 STATE_FILE="$STATE_DIR/parsed_prs.json"
 RETRY_FILE="$STATE_DIR/retries.json"  # internal: retry counters for undecided PRs
@@ -47,6 +53,18 @@ mkdir -p "$STATE_DIR/locks"
 
 log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# Every knob must come from config.env: fail loudly instead of running
+# unattended with empty values.
+missing=""
+for var in REPO AUTHORS BOT_CHECK_NAME RETRY_LIMIT SOUND AI_PROVIDER AI_MODEL_ID AI_VARIANT AI_TIMEOUT; do
+  [ -n "${!var:-}" ] || missing="$missing $var"
+done
+if [ -n "$missing" ]; then
+  log "ERROR: missing required config in config.env (see config.env.example):$missing"
+  exit 1
+fi
+AI_MODEL="$AI_PROVIDER/$AI_MODEL_ID"
 
 # notify <message> [url]: desktop notification. With terminal-notifier
 # installed and a url given, clicking the notification opens the url in the
@@ -172,27 +190,31 @@ clear_retry() {
   retries="$(jq -n --argjson retries "$retries" --arg n "$1" '($retries | del(.[$n]))')"
 }
 
-# --- Batch-record all unknown non-marius PRs as "ignored" (no extra API calls) ---
+# --- Batch-record all unknown non-watched PRs as "ignored" (no extra API calls) ---
 before_len="$(jq 'length' <<<"$state")"
-state="$(jq --slurpfile S "$tmp_state" --arg ts "$(now_iso)" --arg author "$AUTHOR" '
-  reduce (.[] | . as $it | select(.author.login != $author)
+state="$(jq --slurpfile S "$tmp_state" --arg ts "$(now_iso)" --argjson authors "$authors_json" '
+  reduce (.[] | . as $it | (($it.author.login // "") as $login
+           | select(($authors | index($login)) | not))
           | select(($S[0] | has($it.number | tostring)) | not)) as $pr ($S[0];
     . + {($pr.number | tostring): {author: ($pr.author.login // ""),
          decision: "ignored", recorded_at: $ts, findings_file: null, retries: 0}})
 ' <<<"$prs")"
 after_len="$(jq 'length' <<<"$state")"
-log "recorded $((after_len - before_len)) non-marius PRs as ignored"
+log "recorded $((after_len - before_len)) non-watched PRs as ignored"
 
-# --- marius PRs not yet decided ---
-marius_unknown="$(jq -c --slurpfile S "$tmp_state" --arg author "$AUTHOR" '
-  [.[] | . as $pr | select(.author.login == $author)
+# --- Watched-author PRs not yet decided ---
+authors_unknown="$(jq -c --slurpfile S "$tmp_state" --argjson authors "$authors_json" '
+  [.[] | . as $pr | (($pr.author.login // "") as $login
+    | select(($authors | index($login)) != null))
    | select(($S[0] | has($pr.number | tostring)) | not)]
 ' <<<"$prs")"
-log "new $AUTHOR PRs to check: $(jq 'length' <<<"$marius_unknown")"
+log "watching authors: $AUTHORS"
+log "new PRs by watched authors to check: $(jq 'length' <<<"$authors_unknown")"
 
 while IFS= read -r pr; do
   [ -n "$pr" ] || continue
   number="$(jq -r '.number' <<<"$pr")"
+  pr_author="$(jq -r '.author.login // ""' <<<"$pr")"
 
   # Drafts: bot check does not run on drafts; leave unknown (no retry budget).
   if [ "$(jq -r '.isDraft // false' <<<"$pr")" = "true" ]; then
@@ -209,7 +231,7 @@ while IFS= read -r pr; do
   pr_state="$(jq -r '.state // ""' <<<"$detail")"
   review_decision="$(jq -r '.reviewDecision // ""' <<<"$detail")"
   if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ] || [ "$review_decision" = "APPROVED" ]; then
-    record "$number" "$AUTHOR" "ignored" "null" 0
+    record "$number" "$pr_author" "ignored" "null" 0
     clear_retry "$number"
     log "PR #$number: state=$pr_state reviewDecision=$review_decision; recorded as ignored"
     continue
@@ -224,7 +246,7 @@ while IFS= read -r pr; do
     if [ "$BUMP_RESULT" -ge "$RETRY_LIMIT" ]; then
       log "PR #$number: no completed bot check after $BUMP_RESULT cycles -> no-bot-check"
       notify "PR #$number needs attention: no completed bot check after $BUMP_RESULT cycles" "https://github.com/$REPO/pull/$number"
-      record "$number" "$AUTHOR" "no-bot-check" "null" "$BUMP_RESULT"
+      record "$number" "$pr_author" "no-bot-check" "null" "$BUMP_RESULT"
       clear_retry "$number"
     else
       log "PR #$number: bot check not completed yet; waiting (cycle $BUMP_RESULT/$RETRY_LIMIT)"
@@ -249,7 +271,7 @@ while IFS= read -r pr; do
       } > "$SCRIPT_DIR/PR${number}.md"
       log "PR #$number: bot check $conclusion after $BUMP_RESULT cycles -> bot-failed (see PR${number}.md)"
       notify "PR #$number needs attention: bot check $conclusion" "https://github.com/$REPO/pull/$number"
-      record "$number" "$AUTHOR" "bot-failed" "\"PR${number}.md\"" "$BUMP_RESULT"
+      record "$number" "$pr_author" "bot-failed" "\"PR${number}.md\"" "$BUMP_RESULT"
       clear_retry "$number"
     else
       log "PR #$number: bot check $conclusion; retrying (cycle $BUMP_RESULT/$RETRY_LIMIT)"
@@ -403,7 +425,7 @@ while IFS= read -r pr; do
       } > "$out_file"
       log "PR #$number: AI counter-check failed after $BUMP_RESULT cycles -> ai-failed (see PR${number}.md)"
       notify "PR #$number needs attention: AI counter-check failed (AI issue, not a PR problem)" "https://github.com/$REPO/pull/$number"
-      record "$number" "$AUTHOR" "ai-failed" "\"PR${number}.md\"" "$BUMP_RESULT"
+      record "$number" "$pr_author" "ai-failed" "\"PR${number}.md\"" "$BUMP_RESULT"
       clear_retry "$number"
     else
       log "PR #$number: AI counter-check failed ($ai_reason); retrying (cycle $BUMP_RESULT/$RETRY_LIMIT)"
@@ -435,8 +457,8 @@ while IFS= read -r pr; do
 
   log "PR #$number: bot check OK; AI counter-check: $ai_status; $findings_count finding(s)"
   notify "$notify_msg" "https://github.com/$REPO/pull/$number"
-  record "$number" "$AUTHOR" "ready" "$findings_file" 0
-done < <(jq -c '.[]' <<<"$marius_unknown")
+  record "$number" "$pr_author" "ready" "$findings_file" 0
+done < <(jq -c '.[]' <<<"$authors_unknown")
 
 # --- Persist state atomically ---
 jq . <<<"$state" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"

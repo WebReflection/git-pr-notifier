@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# Removes the Marius PR Review Watcher cron job and kills any in-flight check.
+# git-pr-notifier - removes the cron job and kills any in-flight check.
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MARKER="# marius-pr-review-job"
+MARKER="# git-pr-notifier-job"
+# Matches entries from this marker and from any previous personal marker.
+CRON_TAG_RE='(pr-review-job|pr-notifier-job|check_prs\.sh)'
 LOCK_DIR="$SCRIPT_DIR/state/locks/.check.lock"
 PID_FILE="$LOCK_DIR/pid"
 
-if ! crontab -l 2>/dev/null | grep -qF "$MARKER"; then
+if ! crontab -l 2>/dev/null | grep -qE "$CRON_TAG_RE"; then
   echo "not installed"
   exit 0
 fi
 
-remaining="$(crontab -l 2>/dev/null | grep -vE '(marius-pr-review-job|check_prs\.sh)' || true)"
+remaining="$(crontab -l 2>/dev/null | grep -vE "$CRON_TAG_RE" || true)"
 if [ -n "$remaining" ]; then
   printf '%s\n' "$remaining" | crontab -
 else
