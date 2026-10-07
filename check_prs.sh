@@ -166,6 +166,32 @@ fi
 tmp_state="$STATE_DIR/.state.work.json"
 printf '%s' "$state" > "$tmp_state"
 
+# --- Stale report cleanup: PRN.md files are only useful while their PR is
+# actionable. Silently remove them when the PR is closed, merged, or has been
+# approved by a peer meanwhile; failures keep the file and only log. ---
+open_numbers=",$(jq -r '[.[].number | tostring] | join(",")' <<<"$prs"),"
+shopt -s nullglob
+for report in "$SCRIPT_DIR"/PR*.md; do
+  [[ "$report" =~ PR([0-9]+)\.md$ ]] || continue
+  n="${BASH_REMATCH[1]}"
+  if [[ "$open_numbers" != *",$n,"* ]]; then
+    rm -f "$report"
+    log "removed stale report PR${n}.md (PR #$n is closed or merged)"
+    continue
+  fi
+  if stale_json="$(gh pr view "$n" -R "$REPO" --json state,reviewDecision 2>/dev/null)"; then
+    stale_state="$(jq -r '.state // ""' <<<"$stale_json")"
+    stale_decision="$(jq -r '.reviewDecision // ""' <<<"$stale_json")"
+    if [ "$stale_state" != "OPEN" ] || [ "$stale_decision" = "APPROVED" ]; then
+      rm -f "$report"
+      log "removed stale report PR${n}.md (PR #$n state=$stale_state reviewDecision=$stale_decision)"
+    fi
+  else
+    log "WARN: could not fetch PR #$n state; keeping PR${n}.md"
+  fi
+done
+shopt -u nullglob
+
 record() {
   # record <number> <author> <decision> <findings_file_json_literal> <retries>
   local number="$1" author="$2" decision="$3" findings_file="$4" r="$5"
