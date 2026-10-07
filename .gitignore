@@ -3,4 +3,4 @@ config.env
 cron_check.log
 state/
 .kilo/
-
+PR*.md
