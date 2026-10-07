@@ -1,0 +1,6 @@
+gh_token.env
+config.env
+cron_check.log
+state/
+.kilo/
+
