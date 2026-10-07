@@ -245,7 +245,7 @@ while IFS= read -r pr; do
     bump_retry "$number" "no-bot-check"
     if [ "$BUMP_RESULT" -ge "$RETRY_LIMIT" ]; then
       log "PR #$number: no completed bot check after $BUMP_RESULT cycles -> no-bot-check"
-      notify "PR #$number needs attention: no completed bot check after $BUMP_RESULT cycles" "https://github.com/$REPO/pull/$number"
+      notify "☠️ PR #$number needs attention: no completed bot check after $BUMP_RESULT cycles" "https://github.com/$REPO/pull/$number"
       record "$number" "$pr_author" "no-bot-check" "null" "$BUMP_RESULT"
       clear_retry "$number"
     else
@@ -272,7 +272,7 @@ while IFS= read -r pr; do
         echo "- Generated: $(now_iso)"
       } > "$SCRIPT_DIR/PR${number}.md"
       log "PR #$number: bot check $conclusion after $BUMP_RESULT cycles -> bot-failed (see PR${number}.md)"
-      notify "PR #$number needs attention: bot check $conclusion" "https://github.com/$REPO/pull/$number"
+      notify "⚠️ PR #$number - bot check $conclusion after $BUMP_RESULT cycles, see PR${number}.md" "https://github.com/$REPO/pull/$number"
       record "$number" "$pr_author" "bot-failed" "\"PR${number}.md\"" "$BUMP_RESULT"
       clear_retry "$number"
     else
@@ -283,7 +283,7 @@ while IFS= read -r pr; do
 
   # --- Bot check OK: heuristic scan for issues the bot did not flag ---
   findings_file="null"
-  notify_msg="PR #$number is ready for review"
+  notify_msg="✅ PR #$number is ready for review"
   out_file="$SCRIPT_DIR/PR${number}.md"
 
   failing_checks="$(jq -r '
@@ -428,7 +428,11 @@ while IFS= read -r pr; do
         echo "_Bot review report: $(jq -r '.detailsUrl // ""' <<<"$check_json")_"
       } > "$out_file"
       log "PR #$number: AI counter-check failed after $BUMP_RESULT cycles -> ai-failed (see PR${number}.md)"
-      notify "PR #$number needs attention: AI counter-check failed (AI issue, not a PR problem)" "https://github.com/$REPO/pull/$number"
+      if [ "$findings_count" -gt 0 ]; then
+        notify "⚠️ PR #$number - $findings_count finding(s) in PR${number}.md (AI counter-check failed; details inside)" "https://github.com/$REPO/pull/$number"
+      else
+        notify "☠️ PR #$number needs attention: AI counter-check failed (AI issue, not a PR problem)" "https://github.com/$REPO/pull/$number"
+      fi
       record "$number" "$pr_author" "ai-failed" "\"PR${number}.md\"" "$BUMP_RESULT"
       clear_retry "$number"
     else
@@ -456,7 +460,7 @@ while IFS= read -r pr; do
       echo "_Bot review report: $(jq -r '.detailsUrl // ""' <<<"$check_json")_"
     } > "$out_file"
     findings_file="\"PR${number}.md\""
-    notify_msg="PR #$number is ready for review - $findings_count findings, see PR${number}.md"
+    notify_msg="⚠️ PR #$number is ready for review - $findings_count findings, see PR${number}.md"
   else
     rm -f "$out_file"
   fi
