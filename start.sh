@@ -68,6 +68,11 @@ echo "Installed cron entry:"
 crontab -l | grep -A1 -F "$MARKER"
 
 echo "Running first check now..."
-"$SCRIPT_DIR/check_prs.sh"
+# Same redirect as the cron entry so manual/first-run cycles land in
+# cron_check.log too and are diagnosable like every other cycle.
+printf '%s first check triggered by start.sh\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$SCRIPT_DIR/cron_check.log"
+if ! "$SCRIPT_DIR/check_prs.sh" >> "$SCRIPT_DIR/cron_check.log" 2>&1; then
+  fail "first check failed - see $SCRIPT_DIR/cron_check.log"
+fi
 
 echo "Done. The watcher runs every 2 minutes; log: $SCRIPT_DIR/cron_check.log"
