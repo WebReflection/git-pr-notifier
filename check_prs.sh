@@ -2,7 +2,7 @@
 # git-pr-notifier - worker.
 # Invoked by cron every 2 minutes (installed by start.sh) and once by start.sh.
 # For new open PRs in $REPO authored by any login in $AUTHORS: wait for the "$BOT_CHECK_NAME"
-# check to succeed, counter-verify the diff with the local Kilo CLI, run
+# check and review verdict to be clean, counter-verify the diff with the local Kilo CLI, run
 # heuristic scans for issues the bot did not flag, notify on macOS, and persist
 # findings. State lives in ./state/.
 set -euo pipefail
@@ -107,6 +107,106 @@ with_timeout() {
     my $st = $?;
     exit(($st & 127) ? 128 + ($st & 127) : ($st >> 8));
   ' "$secs" "$@"
+}
+
+# A successful check means the review ran, not that the bot found no issues.
+# Require its current-run summary and check unresolved inline feedback too.
+bot_is_clean() {
+  local number="$1" head="$2" bot app_id completed_at comments summary feedback
+  BOT_WAIT_REASON="could not verify the latest bot check"
+  if ! check_json="$(gh api --paginate --method GET "repos/$REPO/commits/$head/check-runs" \
+      -f check_name="$BOT_CHECK_NAME" -f filter=all -f per_page=100 | \
+      jq -sc --arg name "$BOT_CHECK_NAME" --arg head "$head" '
+        [.[] | .check_runs[] | select(.name == $name and .head_sha == $head)]
+        | max_by(.id) // empty | . + {detailsUrl: .details_url}')"; then
+    return 1
+  fi
+  BOT_WAIT_REASON="bot check is missing, pending, unsuccessful, or has annotations"
+  if [ -z "$check_json" ] || ! jq -e '
+      .status == "completed" and .conclusion == "success"
+      and .output.annotations_count == 0
+      and (.app.id | type) == "number" and (.app.slug | type) == "string"
+      and (.app.slug | length) > 0 and (.completed_at | type) == "string"
+      and (.completed_at | length) > 0
+    ' <<<"$check_json" >/dev/null; then
+    return 1
+  fi
+  bot="$(jq -r '.app.slug' <<<"$check_json")"
+  app_id="$(jq '.app.id' <<<"$check_json")"
+  completed_at="$(jq -r '.completed_at' <<<"$check_json")"
+
+  BOT_WAIT_REASON="could not fetch the bot review summary"
+  if ! comments="$(gh api --paginate "repos/$REPO/issues/$number/comments?per_page=100" | jq -s 'add // []')"; then
+    return 1
+  fi
+  summary="$(jq -c --arg bot "$bot" --argjson app "$app_id" '
+      [.[] | select(.performed_via_github_app.id == $app and .user.type == "Bot")
+       | select((.user.login | sub("\\[bot\\]$"; "")) == $bot)
+       | select((.body // "") | contains("<!-- kilo-review -->"))]
+      | max_by(.updated_at, .id) // empty
+    ' <<<"$comments")" || return 1
+  BOT_WAIT_REASON="bot summary is missing, stale, or reports findings"
+  if [ -z "$summary" ] || ! jq -e --arg completed "$completed_at" '
+      (.body | split("<!-- kilo-review-history -->")[0]) as $current |
+      (.updated_at | type) == "string" and .updated_at >= $completed
+      and ([$current | split("\n")[] | gsub("^\\s+|\\s+$"; "")
+            | select(startswith("**Status:**"))][0]
+           == "**Status:** No Issues Found | **Recommendation:** Merge")
+      and all($current | split("\n")[]
+              | select(test("^\\|[^|]*(CRITICAL|WARNING|SUGGESTION)[^|]*\\|"; "i"));
+        ((capture("^\\|[^|]*\\|\\s*[*]*(?<count>[0-9]+)[*]*\\s*\\|") // {}).count == "0"))
+    ' <<<"$summary" >/dev/null; then
+    return 1
+  fi
+
+  BOT_WAIT_REASON="could not verify bot review threads"
+  # The author filter needs [bot], although returned GraphQL logins omit it.
+  if ! feedback="$(gh api graphql --paginate \
+      -F owner="${REPO%%/*}" -F name="${REPO#*/}" -F number="$number" -f bot="${bot}[bot]" \
+      -f query='query($owner: String!, $name: String!, $number: Int!, $bot: String!, $endCursor: String) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            headRefOid state isDraft reviewDecision
+            reviews(last: 1, author: $bot) { nodes { state body commit { oid } } }
+            reviewThreads(first: 100, after: $endCursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                isResolved
+                comments(first: 100) {
+                  nodes { author { login } }
+                  pageInfo { hasNextPage }
+                }
+              }
+            }
+          }
+        }
+      }' | jq -s '.')"; then
+    return 1
+  fi
+  BOT_WAIT_REASON="bot feedback is unresolved or incomplete, or the PR changed"
+  if ! jq -e --arg head "$head" --arg bot "$bot" '
+      length > 0 and all(.[];
+        ((.errors // []) | length) == 0 and
+        (.data.repository.pullRequest | .headRefOid == $head
+          and .state == "OPEN" and .isDraft == false and .reviewDecision != "APPROVED"
+          and (.reviews.nodes | type) == "array"
+          and all(.reviews.nodes[];
+            (.state | type) == "string" and .state != "PENDING" and .state != "CHANGES_REQUESTED"
+            and (.commit.oid != $head or .state == "DISMISSED"
+                 or ((.body // "" | gsub("\\s"; "")) == "")))
+          and (.reviewThreads.nodes | type) == "array"
+          and all(.reviewThreads.nodes[];
+            .isResolved == true or
+            (.isResolved == false and .comments.pageInfo.hasNextPage == false
+             and (.comments.nodes | length) > 0
+             and all(.comments.nodes[];
+               (.author.login | type) == "string"
+               and ((.author.login | sub("\\[bot\\]$"; "")) != $bot))))))
+      and .[-1].data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage == false
+    ' <<<"$feedback" >/dev/null; then
+    return 1
+  fi
+  return 0
 }
 
 # --- Lock (mkdir-based; no flock on macOS) ---
@@ -248,7 +348,7 @@ while IFS= read -r pr; do
     continue
   fi
 
-  if ! detail="$(gh pr view "$number" -R "$REPO" --json statusCheckRollup,reviews,mergeable,mergeStateStatus,files,state,reviewDecision 2>/dev/null)"; then
+  if ! detail="$(gh pr view "$number" -R "$REPO" --json headRefOid,statusCheckRollup,reviews,mergeable,mergeStateStatus,files,state,reviewDecision 2>/dev/null)"; then
     log "WARN: could not fetch details for PR #$number; retrying next cycle"
     continue
   fi
@@ -263,47 +363,13 @@ while IFS= read -r pr; do
     continue
   fi
 
-  check_json="$(jq -c --arg name "$BOT_CHECK_NAME" \
-    '(.statusCheckRollup // []) | map(select(.name? == $name)) | .[0] // empty' <<<"$detail")"
-
-  # --- Bot check missing / not completed: wait, with a safety cap ---
-  if [ -z "$check_json" ] || [ "$(jq -r '.status // ""' <<<"$check_json")" != "COMPLETED" ]; then
-    bump_retry "$number" "no-bot-check"
-    if [ "$BUMP_RESULT" -ge "$RETRY_LIMIT" ]; then
-      log "PR #$number: no completed bot check after $BUMP_RESULT cycles -> no-bot-check"
-      notify "☠️ PR #$number needs attention: no completed bot check after $BUMP_RESULT cycles" "https://github.com/$REPO/pull/$number"
-      record "$number" "$pr_author" "no-bot-check" "null" "$BUMP_RESULT"
-      clear_retry "$number"
-    else
-      log "PR #$number: bot check not completed yet; waiting (cycle $BUMP_RESULT/$RETRY_LIMIT)"
-    fi
-    continue
-  fi
-
-  conclusion="$(jq -r '.conclusion // ""' <<<"$check_json")"
-
-  # --- Bot check completed but not SUCCESS: retry up to RETRY_LIMIT, then report ---
-  if [ "$conclusion" != "SUCCESS" ]; then
-    bump_retry "$number" "bot-failed"
-    if [ "$BUMP_RESULT" -ge "$RETRY_LIMIT" ]; then
-      {
-        echo "# PR #$number - bot check failed"
-        echo
-        echo "https://github.com/$REPO/pull/$number"
-        echo
-        echo "\`$BOT_CHECK_NAME\` did not succeed after $BUMP_RESULT retry cycles."
-        echo
-        echo "- Final status: $(jq -r '.status // ""' <<<"$check_json") / $conclusion"
-        echo "- Bot review report: $(jq -r '.detailsUrl // ""' <<<"$check_json")"
-        echo "- Generated: $(now_iso)"
-      } > "$SCRIPT_DIR/PR${number}.md"
-      log "PR #$number: bot check $conclusion after $BUMP_RESULT cycles -> bot-failed (see PR${number}.md)"
-      notify "⚠️ PR #$number - bot check $conclusion after $BUMP_RESULT cycles, see PR${number}.md" "https://github.com/$REPO/pull/$number"
-      record "$number" "$pr_author" "bot-failed" "\"PR${number}.md\"" "$BUMP_RESULT"
-      clear_retry "$number"
-    else
-      log "PR #$number: bot check $conclusion; retrying (cycle $BUMP_RESULT/$RETRY_LIMIT)"
-    fi
+  head_sha="$(jq -r '.headRefOid // ""' <<<"$detail")"
+  BOT_WAIT_REASON="missing head commit"
+  # Bot findings are already visible on GitHub: wait silently until they are
+  # resolved, without spending the retry budget or permanently ignoring the PR.
+  if [ -z "$head_sha" ] || ! bot_is_clean "$number" "$head_sha"; then
+    clear_retry "$number"
+    log "PR #$number: waiting silently for a clean bot review (${BOT_WAIT_REASON:-missing head commit})"
     continue
   fi
 
@@ -429,6 +495,14 @@ while IFS= read -r pr; do
   fi
   rm -f "$ai_diff" "$ai_out" "$ai_err"
 
+  # The AI call can take minutes. Do not notify about an older head or about
+  # bot feedback that appeared while the counter-check was running.
+  if ! bot_is_clean "$number" "$head_sha"; then
+    clear_retry "$number"
+    log "PR #$number: bot gate changed during counter-check; waiting silently ($BOT_WAIT_REASON)"
+    continue
+  fi
+
   if [ "$ai_status" = "failed" ]; then
     bump_retry "$number" "ai-failed"
     if [ "$BUMP_RESULT" -ge "$RETRY_LIMIT" ]; then
@@ -494,6 +568,7 @@ while IFS= read -r pr; do
   log "PR #$number: bot check OK; AI counter-check: $ai_status; $findings_count finding(s)"
   notify "$notify_msg" "https://github.com/$REPO/pull/$number"
   record "$number" "$pr_author" "ready" "$findings_file" 0
+  clear_retry "$number"
 done < <(jq -c '.[]' <<<"$authors_unknown")
 
 # --- Persist state atomically ---

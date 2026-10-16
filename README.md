@@ -10,4 +10,6 @@ Currently tested on macOS - **experimental**
 
 This should check and validate via Kilocode AI your chosen peer within its PRs and, once everything is fine, it should notify you about it, or inform you there were issues.
 
+Notifications require a successful bot run for the current commit, an explicit `No Issues Found / Merge` summary, and no unresolved bot review feedback. Missing, pending, failed, or warning-bearing bot reviews are rechecked silently each cycle, without consuming the AI retry limit.
+
 That's it, feel free to contribute 👋
